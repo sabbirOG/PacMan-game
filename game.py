@@ -1,4 +1,11 @@
-import sys
+"""Pac-Man style AI game with DFS/BFS/A* ghost behaviors and simple UI.
+
+Core concepts
+- Grid world from LEVEL where '#' are walls, '.' pellets, 'P' player, 'G' ghosts, 'S' special ghosts.
+- Player moves with arrow keys, shoots with 'z'. Ghosts move via selected pathfinding.
+- States: menu, playing, paused, game_over. Win by eating all pellets; lose by running out of lives.
+"""
+
 import time
 import threading
 from dataclasses import dataclass
@@ -6,7 +13,7 @@ from typing import List, Tuple, Optional, Dict, Callable
 import tkinter as tk
 import math
 
-from pathfinding import bfs, dfs, astar, ALGORITHMS
+from pathfinding import bfs, dfs, astar
 
 
 Coord = Tuple[int, int]
@@ -15,24 +22,25 @@ Coord = Tuple[int, int]
 # Basic level map: '#' walls, '.' pellets, ' ' empty, 'P' player spawn, 'G' ghost spawn, 'S' special ghost
 LEVEL: List[str] = [
     "####################",
-    "#P.....#......#...S#",
+    "#P.....#G.....#...S#",
     "#.###..#..##..#..#.#",
-    "#...#..#......#..#.#",
+    "#...#..#..G...#..#.#",
     "#.#.#..###..###..#.#",
-    "#.#.#...........##.#",
+    "#.#.#....G......##.#",
     "#.#.####.##.####.#.#",
-    "#..............#...#",
+    "#......G.......#...#",
     "#.####.######..#.###",
     "#....#........S#...#",
     "#.#..#.######..#.###",
     "#.#..#......#..#...#",
-    "#.#..#.##...#..#.###",
-    "#....#..S....#....P#",
+    "#.#..#.##.G.#..#.###",
+    "#....#..S....#..G.P#",
     "####################",
 ]
 
 
-TILE = 64
+# Rendering scale (tile size in pixels). Smaller number -> smaller window.
+TILE = 48
 ROWS = len(LEVEL)
 COLS = len(LEVEL[0])
 WIDTH = COLS * TILE
@@ -54,6 +62,7 @@ DIFF_ALGO: Dict[str, Callable] = {
 
 @dataclass
 class Entity:
+    """A movable actor on the grid (player or ghost)."""
     row: int
     col: int
     color: str
@@ -66,6 +75,7 @@ class Entity:
         return (self.row, self.col)
 
     def move(self, drow: int, dcol: int, grid: List[str]) -> None:
+        """Attempt to move by (drow, dcol) if destination is not a wall."""
         nr, nc = self.row + drow, self.col + dcol
         if 0 <= nr < ROWS and 0 <= nc < COLS and grid[nr][nc] != '#':
             self.row, self.col = nr, nc
@@ -82,6 +92,7 @@ class Entity:
 
 @dataclass
 class Beam:
+    """A short laser-like projectile from player or ghost."""
     row: int
     col: int
     drow: int
@@ -91,6 +102,7 @@ class Beam:
     active: bool = True
 
     def step(self, grid: List[str]) -> None:
+        """Advance the beam one step or deactivate if hitting wall/bounds."""
         if not self.active:
             return
         nr, nc = self.row + self.drow, self.col + self.dcol
@@ -101,6 +113,7 @@ class Beam:
 
 
 class Game:
+    """Main game controller: state, entities, input, updates, and rendering."""
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("Pac-Man AI - DFS/BFS/A*")
@@ -110,14 +123,16 @@ class Game:
         self.grid: List[str] = LEVEL[:]
         self.pellets: Dict[Coord, bool] = {}
         self.player: Optional[Entity] = None
+        self.player_spawn: Optional[Coord] = None
         self.ghosts: List[Entity] = []
         self.beams: List[Beam] = []
         self.difficulty: str = Difficulty.MEDIUM
         self.score: int = 0
-        self.lives: int = 4
+        self.lives: int = 5
         self.last_ai_tick: float = 0.0
         self.state: str = 'menu'  # 'menu' | 'playing' | 'paused' | 'game_over'
 
+        # Build initial world and UI
         self._parse_level()
         self._bind_keys()
         self._build_menu_ui()
@@ -126,13 +141,21 @@ class Game:
         self._game_loop()
 
     def _parse_level(self) -> None:
+        """Scan LEVEL to place player, ghosts, and pellets; clear spawns from grid."""
         ghost_count = 0
         special_ghost_count = 0
         for r, line in enumerate(self.grid):
             for c, ch in enumerate(line):
                 if ch == 'P':
-                    self.player = Entity(r, c, color='yellow')
-                    self._set_grid(r, c, ' ')
+                    if self.player is None:
+                        # First player spawn encountered becomes the spawn point
+                        self.player = Entity(r, c, color='yellow')
+                        self.player_spawn = (r, c)
+                        self._set_grid(r, c, ' ')
+                    else:
+                        # Handle extra 'P' tiles gracefully: convert to pellet
+                        self._set_grid(r, c, ' ')
+                        self.pellets[(r, c)] = True
                 elif ch == 'G':
                     # Create regular ghost with territory
                     ghost = Entity(r, c, color='red')
@@ -146,12 +169,12 @@ class Game:
                     self.ghosts.append(special_ghost)
                     special_ghost_count += 1
                     self._set_grid(r, c, ' ')
-                if ch in ('.', ' '):
-                    # Place pellets on empty and dot tiles
-                    self.pellets[(r, c)] = ch == '.' or ch == ' '
+                if ch == '.':
+                    # Place pellets on dot tiles only
+                    self.pellets[(r, c)] = True
 
     def _define_ghost_territory(self, start_r: int, start_c: int, ghost_id: int) -> List[Coord]:
-        """Define territory for each ghost based on their spawn position"""
+        """Define territory for ghost based on its index; defaults to area around spawn."""
         territories = [
             # Ghost 0: Top-right area
             [(r, c) for r in range(1, 8) for c in range(10, 19)],
@@ -171,11 +194,13 @@ class Game:
                    for c in range(max(0, start_c-2), min(COLS, start_c+3))]
 
     def _set_grid(self, r: int, c: int, ch: str) -> None:
+        """Set a single character in the grid string row."""
         row = list(self.grid[r])
         row[c] = ch
         self.grid[r] = ''.join(row)
 
     def _bind_keys(self) -> None:
+        """Register keyboard controls for movement, shooting, difficulty, and pause."""
         self.root.bind('<Up>', lambda e: self._move_player(-1, 0))
         self.root.bind('<Down>', lambda e: self._move_player(1, 0))
         self.root.bind('<Left>', lambda e: self._move_player(0, -1))
@@ -185,8 +210,11 @@ class Game:
         self.root.bind('2', lambda e: self._set_difficulty(Difficulty.MEDIUM))
         self.root.bind('3', lambda e: self._set_difficulty(Difficulty.HARD))
         self.root.bind('<Escape>', lambda e: self._toggle_pause())
+        # Start the game with Enter when on the menu
+        self.root.bind('<Return>', lambda e: self._start_game() if self.state == 'menu' else None)
 
     def _toggle_pause(self) -> None:
+        """Toggle pause state and corresponding overlay."""
         if self.state == 'playing':
             self.state = 'paused'
             self._show_pause()
@@ -198,6 +226,7 @@ class Game:
             pass
 
     def _build_menu_ui(self) -> None:
+        """Create menu, pause, and game-over overlays."""
         self.menu_var = tk.StringVar(value=self.difficulty)
         self.menu_frame = tk.Frame(self.root, bg='black')
         self.menu_title = tk.Label(self.menu_frame, text='Pac-Man AI', fg='yellow', bg='black', font=('Arial', 16, 'bold'))
@@ -237,29 +266,38 @@ class Game:
 
 
     def _start_game(self) -> None:
+        """Start a new game from menu with selected difficulty."""
         self.difficulty = self.menu_var.get()
         self._hide_menu()
         self._reset_level()
-        self.lives = 4  # Reset lives to 4
+        self.lives = 5  # Reset lives to 5
+        # Ensure default overlay label
+        self.game_over_label.config(text='Game Over')
         self.state = 'playing'
 
     def _resume_from_pause(self) -> None:
+        """Resume gameplay from pause overlay."""
         self.state = 'playing'
         self._hide_pause()
 
     def _quit_to_menu(self) -> None:
+        """Return to main menu from pause or game-over screens."""
         self.state = 'menu'
         self._hide_pause()
         self._hide_game_over()
         self._show_menu()
 
     def _restart_game(self) -> None:
+        """Restart gameplay from game-over screen."""
         self._hide_game_over()
         self._reset_level()
-        self.lives = 4
+        self.lives = 5
+        # Ensure default overlay label
+        self.game_over_label.config(text='Game Over')
         self.state = 'playing'
 
     def _show_game_over(self) -> None:
+        """Display game-over (or win) overlay with final score."""
         self.final_score_label.config(text=f'Final Score: {self.score}')
         self.game_over_frame.place(x=WIDTH//2 - 100, y=HEIGHT//2 - 80, width=200, height=160)
         self.game_over_frame.lift()
@@ -287,10 +325,11 @@ class Game:
         self.grid = LEVEL[:]
         self.pellets = {}
         self.player = None
+        self.player_spawn = None
         self.ghosts = []
         self.beams = []
         self.score = 0
-        self.lives = 4
+        self.lives = 5
         self._parse_level()
 
     def _set_difficulty(self, d: str) -> None:
@@ -301,6 +340,7 @@ class Game:
                 self.menu_var.set(d)
 
     def _move_player(self, dr: int, dc: int) -> None:
+        """Move player by (dr, dc), eat pellet, update score, and check win."""
         if self.state != 'playing':
             return
         if not self.player or not self.player.alive:
@@ -311,8 +351,12 @@ class Game:
         if pos in self.pellets and self.pellets[pos]:
             self.pellets[pos] = False
             self.score += 10
+            # Check win condition
+            if self._check_win():
+                self._handle_win()
 
     def _fire_player(self) -> None:
+        """Fire a short beam in the player's current (or default) direction."""
         if self.state != 'playing':
             return
         if not self.player:
@@ -325,6 +369,7 @@ class Game:
         self.beams.append(beam)
 
     def _ghost_fire(self, ghost: Entity) -> None:
+        """Have a ghost fire a beam along its current direction if moving."""
         drow, dcol = ghost.direction
         if drow == 0 and dcol == 0:
             return
@@ -332,6 +377,7 @@ class Game:
         self.beams.append(beam)
 
     def _game_loop(self) -> None:
+        """Heartbeat: update AI and beams at ~30 FPS with ~5 Hz AI ticks."""
         now = time.time()
         if self.state == 'playing':
             if now - self.last_ai_tick > 0.2:  # AI tick ~5 Hz
@@ -343,6 +389,7 @@ class Game:
         self.root.after(33, self._game_loop)  # ~30 FPS
 
     def _update_ai(self) -> None:
+        """Update each ghost: pathfind toward player or patrol; handle firing cadence."""
         if not self.player:
             return
         algo = DIFF_ALGO.get(self.difficulty, bfs)
@@ -367,22 +414,28 @@ class Game:
                     # If no path found, try to move towards target directly
                     self._move_towards_target(ghost, target)
                 
-                # Fire more aggressively when chasing
-                if ghost.is_special:
-                    # Special ghosts fire very frequently
-                    if int(time.time() * 4) % 3 == 0:
+                # Distance-gated, probabilistic firing (less aggressive overall)
+                gr, gc = ghost.pos()
+                pr, pc = target
+                dist = abs(gr - pr) + abs(gc - pc)
+                if dist <= 6:
+                    import random
+                    if ghost.is_special:
+                        fire_p = 0.25  # 25% chance per AI tick in range
+                    elif self.difficulty == Difficulty.HARD:
+                        fire_p = 0.20
+                    elif self.difficulty == Difficulty.MEDIUM:
+                        fire_p = 0.12
+                    else:  # EASY
+                        fire_p = 0.08
+                    if random.random() < fire_p:
                         self._ghost_fire(ghost)
-                elif self.difficulty == Difficulty.HARD:
-                    self._ghost_fire(ghost)
-                elif self.difficulty == Difficulty.MEDIUM and int(time.time() * 3) % 4 == 0:
-                    self._ghost_fire(ghost)
-                elif self.difficulty == Difficulty.EASY and int(time.time() * 3) % 6 == 0:
-                    self._ghost_fire(ghost)
             else:
                 # When not in territory, move randomly or patrol
                 self._patrol_ghost(ghost)
 
     def _update_beams(self) -> None:
+        """Advance active beams and drop inactive ones."""
         for beam in self.beams:
             if beam.active:
                 beam.step(self.grid)
@@ -390,6 +443,7 @@ class Game:
         self.beams = [b for b in self.beams if b.active]
 
     def _check_collisions(self) -> None:
+        """Resolve beam hits and ghost-player contact; also re-check win."""
         if not self.player:
             return
         # Beam vs Ghost / Player
@@ -415,7 +469,12 @@ class Game:
             if ghost.alive and self.player.alive and ghost.pos() == self.player.pos():
                 self._lose_life()
 
+        # If all pellets are eaten due to ghost-player collision side effects, still win
+        if self.state == 'playing' and self._check_win():
+            self._handle_win()
+
     def _lose_life(self) -> None:
+        """Decrement lives and respawn player or end game."""
         if self.lives > 0:
             self.lives -= 1
             if self.lives <= 0:
@@ -424,17 +483,13 @@ class Game:
             else:
                 # Reset player position to starting position
                 if self.player:
-                    # Find starting position
-                    for r, line in enumerate(LEVEL):
-                        for c, ch in enumerate(line):
-                            if ch == 'P':
-                                self.player.row = r
-                                self.player.col = c
-                                self.player.direction = (0, 0)
-                                break
+                    # Use remembered spawn if available
+                    if self.player_spawn is not None:
+                        self.player.row, self.player.col = self.player_spawn
+                        self.player.direction = (0, 0)
 
     def _move_towards_target(self, ghost: Entity, target: Coord) -> None:
-        """Move ghost towards target when pathfinding fails"""
+        """Move a ghost one step in the general direction of target if possible."""
         tr, tc = target
         gr, gc = ghost.pos()
         
@@ -454,19 +509,16 @@ class Game:
         ghost.move(dr, dc, self.grid)
 
     def _patrol_ghost(self, ghost: Entity) -> None:
-        """Make ghost patrol within their territory using all 4 directions"""
+        """Patrol within territory by occasionally picking a random valid direction."""
         import random
         
-        # Different patrol behavior based on difficulty
+        # Slightly lower patrol change rates to make pursuit less erratic
         if self.difficulty == Difficulty.EASY:
-            # Easy: 25% chance to change direction
-            patrol_chance = 0.25
+            patrol_chance = 0.18
         elif self.difficulty == Difficulty.MEDIUM:
-            # Medium: 35% chance to change direction
-            patrol_chance = 0.35
+            patrol_chance = 0.28
         else:  # HARD
-            # Hard: 45% chance to change direction
-            patrol_chance = 0.45
+            patrol_chance = 0.38
         
         # Try to move in a random direction
         if random.random() < patrol_chance:
@@ -492,6 +544,7 @@ class Game:
                         break
 
     def _schedule_ghost_respawn(self, ghost: Entity) -> None:
+        """Revive a defeated ghost after a short delay on a background thread."""
         def revive():
             if ghost.is_special:
                 time.sleep(3.0)  # 3 seconds for special ghosts
@@ -501,6 +554,7 @@ class Game:
         threading.Thread(target=revive, daemon=True).start()
 
     def _draw(self) -> None:
+        """Render the grid, pellets, entities, beams, hearts, and UI overlays."""
         self.canvas.delete('all')
         # Draw grid
         for r in range(ROWS):
@@ -574,8 +628,12 @@ class Game:
             # Dim the background
             self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill='#000000', outline='', stipple='gray50')
             self.canvas.create_text(WIDTH//2, HEIGHT//2 - 120, fill='white', text='Game Paused', font=('Segoe UI', 16, 'bold'))
+        elif self.state == 'game_over' and self.game_over_label.cget('text') == 'You Win!':
+            # Dim background slightly for win as well
+            self.canvas.create_rectangle(0, 0, WIDTH, HEIGHT, fill='#000000', outline='', stipple='gray25')
 
     def _draw_circle(self, grid_c: int, grid_r: int, fill: str) -> None:
+        """Draw a filled circle inside a tile (helper)."""
         x0 = grid_c * TILE + 2
         y0 = grid_r * TILE + 2
         x1 = x0 + TILE - 4
@@ -583,6 +641,7 @@ class Game:
         self.canvas.create_oval(x0, y0, x1, y1, fill=fill, outline='')
 
     def _draw_pacman(self, grid_c: int, grid_r: int, direction: Coord) -> None:
+        """Draw animated Pac-Man with mouth angle based on time and direction."""
         x0 = grid_c * TILE + 2
         y0 = grid_r * TILE + 2
         x1 = x0 + TILE - 4
@@ -607,6 +666,7 @@ class Game:
         self.canvas.create_arc(x0, y0, x1, y1, start=start, extent=extent, fill='yellow', outline='', style=tk.PIESLICE)
 
     def _draw_ghost(self, grid_c: int, grid_r: int, direction: Coord, ghost_color: str = '#ff3b3b', pupil_color: str = '#3b8bff') -> None:
+        """Draw a stylized ghost with eyes that drift toward movement direction."""
         x = grid_c * TILE
         y = grid_r * TILE
         pad = 2
@@ -657,7 +717,7 @@ class Game:
         start_x = 10
         start_y = 10
         
-        for i in range(4):
+        for i in range(5):
             x = start_x + i * heart_spacing
             y = start_y
             
@@ -667,6 +727,17 @@ class Game:
             else:
                 # Empty heart (gray)
                 self.canvas.create_text(x, y, text='♡', fill='#444444', font=('Arial', heart_size, 'bold'))
+
+    def _check_win(self) -> bool:
+        # Win when all pellets are eaten
+        return not any(self.pellets.values()) if self.pellets else False
+
+    def _handle_win(self) -> None:
+        # Stop gameplay and show win overlay using existing frame
+        self.state = 'game_over'
+        self.final_score_label.config(text=f'Final Score: {self.score}')
+        self.game_over_label.config(text='You Win!')
+        self._show_game_over()
 
 
 
